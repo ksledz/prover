@@ -1,0 +1,4 @@
+description/*
+tests/*
+run_tests.sh
+score.txt

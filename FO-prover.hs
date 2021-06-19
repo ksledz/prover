@@ -22,8 +22,10 @@ import Formula
 import Parser hiding (one)
 import Utils
 
-prover phi = prover_ $ skolemize $ quantiFix $ nnf $ Not phi
---prover_ phi = debug "pseudo-skolemized formula and herbrand universe" phi `seq` True
+prover phi = do
+  let pass1 = relPolarityOptimize $ nnf $ Not phi
+  if pass1 == T then False else prover_ $ skolemize $ quantiFix pass1
+
 prover_ (sf, hud) = do
   let initHU = makeHU hud
   let (_, funcArs, hasForAll) = hud
@@ -62,6 +64,50 @@ nnf (Forall var phi) = Forall var (nnf phi)
 nnf phi = phi
 
 -- NNF optimizations
+-- first set is not-negated relations, second negated
+type RelState = (Set VarName, Set VarName)
+type RelMonad a = State RelState a
+relPolarityOptimize :: Formula -> Formula
+relPolarityOptimize f =
+  let (_, state) = runState (relPolarityAnalyze f) (Set.empty, Set.empty)
+  in relPolarityReplace f state
+relPolarityAnalyze :: Formula -> RelMonad ()
+relPolarityAnalyze (Not (Rel name _)) = do
+   (posi, neg) <- get
+   let newNeg = Set.insert name neg 
+   put (posi, newNeg)
+relPolarityAnalyze (Rel name _) = do
+  (posi, neg) <- get
+  let newPosi = Set.insert name posi
+  put (newPosi, neg)
+relPolarityAnalyze (And f1 f2) = do
+  relPolarityAnalyze f1
+  relPolarityAnalyze f2
+relPolarityAnalyze (Or f1 f2) = do
+  relPolarityAnalyze f1
+  relPolarityAnalyze f2
+relPolarityAnalyze (Forall v f) = relPolarityAnalyze f
+relPolarityAnalyze (Exists v f) = relPolarityAnalyze f
+
+relPolarityReplace :: Formula -> RelState -> Formula
+relPolarityReplace (Rel name terms) (posi, neg) =  if Set.notMember name neg then T else Rel name terms
+relPolarityReplace (Not (Rel name terms)) (posi, neg) = if Set.notMember name posi then T else Not (Rel name terms)
+relPolarityReplace (And f1 f2) state = do
+  let sf1 = relPolarityReplace f1 state
+  let sf2 = relPolarityReplace f2 state
+  if sf1 == T then sf2
+  else if sf2 == T then sf1 else And sf1 sf2
+relPolarityReplace (Or f1 f2) state = do
+  let sf1 = relPolarityReplace f1 state
+  let sf2 = relPolarityReplace f2 state
+  if sf1 == T || sf2 == T then T else Or sf1 sf2
+relPolarityReplace (Forall v f) state = do
+  let sf = relPolarityReplace f state
+  if sf == T then T else Forall v sf
+relPolarityReplace (Exists v f) state = do
+  let sf = relPolarityReplace f state
+  if sf == T then T else Exists v sf
+
 quantiFix :: Formula -> Formula
 quantiFix_ :: Formula -> Formula 
 quantiFixFV :: Formula -> [VarName] -> Formula
@@ -133,8 +179,7 @@ skolemizeTerm :: Map String STerm -> Term -> SMonad STerm
 skolemizeForm :: Map String STerm -> Int -> Formula -> SMonad SForm
 skolemize :: Formula -> (SForm, HUDesc)
 
-skolemizeTerm vars (Var name) = do
-  return (vars Map.! name)
+skolemizeTerm vars (Var name) = return (vars Map.! name)
 skolemizeTerm _ (Fun name []) = do
   id <- getConst name
   return (SConst id)
@@ -209,7 +254,6 @@ growHUByFunc :: Int -> (Int, Int) -> HerbrandMonad ()
 growHUByFunc origItems (funId, funAr) = do
   mapM_ (evalFunc funId) (makeArgs funAr origItems)
 
--- kazda krotka n argumentowa z 0..k-1
 makeArgs :: Int -> Int -> [[Int]]
 makeArgs 0 _ = [[]]
 makeArgs n k = [h:t | t <- makeArgs (n-1) k, h <- [0..(k-1)] ]

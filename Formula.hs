@@ -30,9 +30,6 @@ variables (Fun _ ts) = nub $ concatMap variables ts
 type FunInt a = FunName -> [a] -> a
 type Env a = VarName -> a
 
-evalTerm :: FunInt a -> Env a -> Term -> a
-evalTerm _ rho (Var x) = rho x
-evalTerm int rho (Fun f ts) = int f $ map (evalTerm int rho) ts
 
 -- our inductive type for first-order logic formulas
 data Formula =
@@ -68,18 +65,6 @@ u =/= v = Not (u === v)
 
 type Substitution = Env Term
 
--- apply a substitution on all free variables
-apply :: Substitution -> Formula -> Formula
-apply _ F = F
-apply _ T = T
-apply f (Rel r ts) = Rel r $ map (evalTerm Fun f) ts
-apply f (Not phi) = Not (apply f phi)
-apply f (Or phi psi) = Or (apply f phi) (apply f psi)
-apply f (And phi psi) = And (apply f phi) (apply f psi)
-apply f (Implies phi psi) = Implies (apply f phi) (apply f psi)
-apply f (Iff phi psi) = Iff (apply f phi) (apply f psi)
-apply f (Exists x phi) = Exists x (apply (update f x (Var x)) phi)
-apply f (Forall x phi) = Forall x (apply (update f x (Var x)) phi)
 
 instance {-# OVERLAPPING #-} Arbitrary VarName where
   arbitrary = elements ["x", "y", "z", "t"]

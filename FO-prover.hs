@@ -5,6 +5,8 @@ module Main where
 import Data.List
 import Data.Map (Map)
 import qualified Data.Map as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 
 import System.IO
 import System.Random
@@ -21,7 +23,25 @@ import Parser hiding (one)
 import Utils
 
 prover phi = prover_ $ skolemize $ quantiFix $ nnf $ Not phi
-prover_ phi = debug "pseudo-skolemized formula and herbrand universe" phi `seq` True
+--prover_ phi = debug "pseudo-skolemized formula and herbrand universe" phi `seq` True
+prover_ (sf, hud) = do
+  let initHU = makeHU hud
+  let (_, funcArs, hasForAll) = hud
+  if funcArs == [] || not hasForAll then do 
+    let (pf, nVars) = evalSForm sf initHU
+    let cnff = tseytin pf nVars
+    not (satSolver cnff)
+  else  
+    proverLoop sf hud initHU
+
+proverLoop :: SForm -> HUDesc -> HUState -> Bool
+proverLoop sf hud hu = do
+  let (pf, nVars) = evalSForm sf hu
+  let cnff = tseytin pf nVars
+  if satSolver cnff then do
+    let (_, newHU) = runState (growHU hud) hu
+    proverLoop sf hud newHU
+  else True
 
 -- NNF conversion
 nnf :: Formula -> Formula 
@@ -65,7 +85,7 @@ data SForm = SAnd SForm SForm | SOr SForm SForm | SRel Bool String [STerm] | SFo
 type SState = (Int, [Int], Bool, Map String Int, Map String Int)
 type SMonad a = State SState a
 
-type HerbrandUniverse = (Int, [Int], Bool)
+type HUDesc = (Int, [Int], Bool)
 
 getConst :: String -> SMonad Int
 getFun :: String -> Int -> SMonad Int
@@ -111,7 +131,7 @@ makeFun ar = do
 
 skolemizeTerm :: Map String STerm -> Term -> SMonad STerm
 skolemizeForm :: Map String STerm -> Int -> Formula -> SMonad SForm
-skolemize :: Formula -> (SForm, HerbrandUniverse)
+skolemize :: Formula -> (SForm, HUDesc)
 
 skolemizeTerm vars (Var name) = do
   return (vars Map.! name)
@@ -162,6 +182,185 @@ skolemize formula = do
   let initState = (0, [], False, Map.empty, Map.empty)
   let (sf, (a, b, c, _, _)) = runState (skolemizeForm Map.empty 0 formula) initState
   (sf, ((if a == 0 then 1 else a), b, c))
+
+-- herbrand universe growth
+-- number of items in hu, map of function evaluations, number of propositional vars used, map of relation evaluations (into propositional variables)
+type HUState = (Int, Map (Int, [Int]) Int, Int, Map (String, [Int]) Int)
+type HerbrandMonad a = State HUState a
+
+evalFunc :: Int -> [Int] -> HerbrandMonad Int
+evalFunc id args = do
+  (nItems, map, a, b)  <- get
+  case Map.lookup (id, args) map of
+    Just herbrandId -> return herbrandId
+    Nothing -> do
+      put (nItems+1, Map.insert (id, args) nItems map, a, b)
+      return nItems
+
+makeHU :: HUDesc -> HUState
+makeHU (nrConst, _, _) = (nrConst, Map.empty, 0, Map.empty)
+
+growHU :: HUDesc -> HerbrandMonad ()
+growHU (_, funArs, _) = do
+  (origItems, _, _, _) <- get
+  mapM_ (growHUByFunc origItems) (zip [0..] funArs) 
+
+growHUByFunc :: Int -> (Int, Int) -> HerbrandMonad ()
+growHUByFunc origItems (funId, funAr) = do
+  mapM_ (evalFunc funId) (makeArgs funAr origItems)
+
+-- kazda krotka n argumentowa z 0..k-1
+makeArgs :: Int -> Int -> [[Int]]
+makeArgs 0 _ = [[]]
+makeArgs n k = [h:t | t <- makeArgs (n-1) k, h <- [0..(k-1)] ]
+
+-- skolem form -> propositional form
+data PForm = PAnd [PForm] | POr [PForm] | PVar Int Bool deriving (Show, Eq)
+
+evalRel :: String -> [Int] -> HerbrandMonad Int
+evalRel id args = do
+  (a, b,nrPVars, map) <- get
+  case Map.lookup (id, args) map of
+    Just pVarId -> return pVarId
+    Nothing -> do
+      put (a, b, nrPVars+1, Map.insert (id, args) nrPVars map)
+      return nrPVars
+
+evalTerm :: [Int] -> STerm -> HerbrandMonad Int
+evalTerm varVals (SVar varId) = return (varVals !! varId)
+evalTerm varVals (SFun funId funTerms) = do
+  evaledTerms <- mapM (evalTerm varVals) funTerms
+  evalFunc funId evaledTerms
+evalTerm varVals (SConst constId) = return constId
+
+evalSForm :: SForm -> HUState -> (PForm, Int)
+evalSForm f hu = let (origItems, _, _, _) = hu in let (pf, (_, _, nrVars, _)) =  runState (evalFormula [] origItems f) hu in (pf, nrVars)
+
+evalFormula :: [Int] -> Int -> SForm -> HerbrandMonad PForm
+evalFormula varVals origItems (SAnd f1 f2) = do
+  pf1 <- evalFormula varVals origItems f1
+  pf2 <- evalFormula varVals origItems f2
+  return (makePAnd [pf1, pf2])
+evalFormula varVals origItems (SOr f1 f2) = do
+  pf1 <- evalFormula varVals origItems f1
+  pf2 <- evalFormula varVals origItems f2
+  return (makePOr [pf1, pf2])
+evalFormula varVals _ (SRel negated name terms) = do
+  evaledTerms <- mapM (evalTerm varVals) terms
+  evaledRel <- evalRel name evaledTerms
+  return (PVar evaledRel negated)
+evalFormula varVals origItems (SForAll f) = do
+  forms <- mapM (\x -> evalFormula (varVals ++ [x]) origItems f) [0..origItems-1] 
+  return (makePAnd forms)
+
+makePAnd :: [PForm] -> PForm
+makePAnd forms = PAnd $ concat (map breakPAnd forms)
+breakPAnd :: PForm -> [PForm]
+breakPAnd (PAnd forms) = forms
+breakPAnd x = [x]
+
+
+makePOr :: [PForm] -> PForm
+makePOr forms = POr $ concat (map breakPOr forms)
+breakPOr :: PForm -> [PForm]
+breakPOr (POr forms) = forms
+breakPOr x = [x]
+
+-- tseytin
+type CNFLiteral = (Int, Bool)
+type CNFClause = [CNFLiteral]
+type CNFForm = [CNFClause]
+-- how many vars used, already emitted clauses, end cache
+type TseytinState = (Int, [CNFClause], Map [CNFLiteral] CNFLiteral)
+type TseytinMonad a = State TseytinState a
+negateLiteral :: CNFLiteral -> CNFLiteral
+negateLiteral (i, b) = (i, not b)
+emitAnd :: [CNFLiteral] -> TseytinMonad CNFLiteral
+emitAnd literals = do
+  (vars, clauses, cache) <- get
+  case Map.lookup literals cache of
+    Just literal -> return literal
+    Nothing -> do
+      let newLiteral = (vars, False)
+      let clause1 = newLiteral:(map negateLiteral literals)
+      let clauses2 = map (\x -> [x, negateLiteral newLiteral]) literals
+      let newClauses = clause1:clauses2
+      put (vars+1, newClauses ++ clauses, Map.insert literals newLiteral cache)
+      return newLiteral
+tseytin :: PForm -> Int -> CNFForm
+tseytinForm :: PForm -> TseytinMonad CNFLiteral
+
+tseytinForm (PAnd forms) = do
+  literals <- mapM tseytinForm forms
+  emitAnd literals
+
+tseytinForm (POr forms) = do
+  literals <- mapM tseytinForm forms
+  andLiteral <- emitAnd (map negateLiteral literals)
+  return (negateLiteral andLiteral)
+
+tseytinForm (PVar i b) = do
+  return (i, b)
+
+tseytin p i = do
+  let initState = (i, [], Map.empty)
+  let (finalLiteral, (_, clauses, _)) = runState (tseytinForm p) initState
+  [finalLiteral]:clauses
+
+-- SAT solver
+propagateUnits :: CNFForm -> Maybe CNFForm
+propagateUnits formula = do
+  let units = findUnits formula -- units is a set
+  if Set.null units then Just formula 
+  else if unitsConsistent units then do
+    let newFormula = filter (nonPositiveClause units) formula
+    let newerFormula = map (deleteNegations units) newFormula
+    propagateUnits newerFormula
+  else Nothing
+
+findUnits :: CNFForm -> Set CNFLiteral
+findUnits formula = Set.fromList $ map (\[x] -> x) (filter singularClause formula)
+singularClause :: CNFClause -> Bool
+singularClause [_] = True
+singularClause clause = False
+nonPositiveClause :: Set CNFLiteral -> CNFClause -> Bool
+nonPositiveClause units clause = all (\x -> Set.notMember x units) clause
+unitsConsistent :: Set CNFLiteral -> Bool
+unitsConsistent units = all (\x -> Set.notMember (negateLiteral x) units) units
+deleteNegations :: Set CNFLiteral -> CNFClause -> CNFClause
+deleteNegations units clause = filter (\x -> Set.notMember (negateLiteral x) units) clause
+
+
+cleanClauses :: CNFForm -> CNFForm
+cleanClauses formula = map Set.toList $ filter unitsConsistent (map Set.fromList formula) 
+
+
+optimizePureLiterals :: CNFForm -> CNFForm
+optimizePureLiterals formula = do
+  let allLiterals = Set.fromList $ concat formula
+  let pureLiterals = Set.filter (\x -> Set.notMember (negateLiteral x) allLiterals) allLiterals
+  if Set.null pureLiterals then formula else do
+    let newFormula = filter (nonPositiveClause pureLiterals) formula
+    optimizePureLiterals newFormula
+
+satSolver :: CNFForm -> Bool
+satSolver f = do 
+  let f2 = cleanClauses f
+  case propagateUnits f2 of
+    Just f3 -> do
+      let f4 = optimizePureLiterals f3
+      if f4 == [] then True 
+      else if elem [] f4 then False 
+      else do
+        let var = pickResolveVar f4
+        let f5a =  [(var, True)]:f4
+        let f5b = [(var, False)]:f4
+        satSolver f5a || satSolver f5b
+    Nothing -> False
+  
+pickResolveVar :: CNFForm -> Int
+-- TODO better heuristics
+pickResolveVar (((var, _):_):_) = var
 
 -- main
 main :: IO ()
